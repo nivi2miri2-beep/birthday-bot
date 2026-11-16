@@ -1,219 +1,267 @@
-import os
 import discord
 from discord.ext import commands, tasks
-from discord import app_commands
-import asyncpg
+from discord import app_commands, ui
+import os
 from datetime import datetime
-from zoneinfo import ZoneInfo, available_timezones
+import pytz
+import asyncpg
+
+# ================= قراءة المتغيرات من Railway =================
+TOKEN = os.getenv("DISCORD_TOKEN")
+DATABASE_URL = os.getenv("DATABASE_URL")
+ANNOUNCEMENT_CHANNEL_ID = int(os.getenv("ANNOUNCEMENT_CHANNEL_ID", "0"))
+IMAGE_FILENAME = "birthday_banner.jpg"
+TIMEZONE = pytz.timezone("Africa/Casablanca")
+# ===============================================================
 
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 
-bot = commands.Bot(command_prefix="!", intents=intents)
+class BirthdayBot(commands.Bot):
+    def __init__(self):
+        super().__init__(command_prefix="!", intents=intents)
+        self.db = None
 
-DATABASE_URL = os.getenv("DATABASE_URL")
-CHANNEL_ID = int(os.getenv("CHANNEL_ID", "0"))
+    async def setup_hook(self):
+        try:
+            self.db = await asyncpg.connect(DATABASE_URL)
+            print("✅ تم الاتصال بقاعدة البيانات بنجاح!")
+        except Exception as e:
+            print(f"❌ خطأ في الاتصال بقاعدة البيانات: {e}")
 
-db_pool = None
+        self.add_view(BirthdayRegisterView(self))
+        await self.tree.sync()
 
-@bot.event
-async def on_ready():
-    global db_pool
-    db_pool = await asyncpg.create_pool(DATABASE_URL)
-    
-    # Zdna timezone column f database ila makantsch
-    async with db_pool.acquire() as connection:
-        await connection.execute("""
-            CREATE TABLE IF NOT EXISTS birthdays (
-                id SERIAL PRIMARY KEY,
-                user_id VARCHAR(50) NOT NULL,
-                guild_id VARCHAR(50) NOT NULL,
-                birth_day INT NOT NULL,
-                birth_month INT NOT NULL,
-                timezone VARCHAR(100) DEFAULT 'Africa/Casablanca',
-                last_wished_year INT DEFAULT 0,
-                UNIQUE(user_id, guild_id)
-            );
-        """)
-    
+bot = BirthdayBot()
+
+def is_valid_date(day: int, month: int) -> bool:
     try:
-        synced = await bot.tree.sync()
-        print(f"Synced {len(synced)} slash commands.")
-    except Exception as e:
-        print(e)
-        
-    # N-reddouha t-cheki kol sa3a (Hourly) machi ghir kol nhar, bach n-chofo wach wslat 12 f ay tanzim
-    check_birthdays.start()
-    print(f"Bot {bot.user} is online and ready with Timezones!")
+        datetime(year=2024, month=month, day=day)
+        return True
+    except ValueError:
+        return False
 
-# ==================== 1. SETUP BIRTHDAY WITH TIMEZONE ====================
-class BirthdayModal(discord.ui.Modal, title="تسجيل عيد الميلاد 🎂"):
-    day = discord.ui.TextInput(label="اليوم (1-31)", placeholder="مثال: 15", max_length=2)
-    month = discord.ui.TextInput(label="الشهر (1-12)", placeholder="مثال: 11", max_length=2)
-    tz = discord.ui.TextInput(label="المنطقة الزمنية (Timezone)", placeholder="مثال: Asia/Beirut أو Africa/Casablanca", default="Africa/Casablanca")
+# ================= 1. نافذة إدخال التاريخ (للزِر) =================
+class BirthdayModal(ui.Modal, title="تسجيل تاريخ الميلاد 🎂"):
+    def __init__(self, bot_instance):
+        super().__init__()
+        self.bot_instance = bot_instance
+
+    month_input = ui.TextInput(
+        label="الشهر (Month)",
+        placeholder="مثال: 5 أو 11",
+        min_length=1,
+        max_length=2,
+        required=True
+    )
+    day_input = ui.TextInput(
+        label="اليوم (Day)",
+        placeholder="مثال: 9 أو 24",
+        min_length=1,
+        max_length=2,
+        required=True
+    )
 
     async def on_submit(self, interaction: discord.Interaction):
         try:
-            d = int(self.day.value)
-            m = int(self.month.value)
-            user_tz = self.tz.value.strip()
-            
-            # Vérification wach timezone s7iha
-            if user_tz not in available_timezones():
-                raise ValueError("Invalid Timezone")
-                
-            if not (1 <= d <= 31 and 1 <= m <= 12):
-                raise ValueError()
+            month = int(self.month_input.value.strip())
+            day = int(self.day_input.value.strip())
         except ValueError:
-            await interaction.response.send_message("❌ التاريخ أو Timezone غير صحيح! (مثال لـ لبنان: Asia/Beirut، المغرب: Africa/Casablanca)", ephemeral=True)
-            return
+            return await interaction.response.send_message(
+                "❌ عذراً، يرجى إدخال أرقام صحيحة للشهر واليوم.", ephemeral=True
+            )
 
-        async with db_pool.acquire() as conn:
-            await conn.execute("""
-                INSERT INTO birthdays (user_id, guild_id, birth_day, birth_month, timezone)
-                VALUES ($1, $2, $3, $4, $5)
+        if not is_valid_date(day, month):
+            return await interaction.response.send_message(
+                "❌ هذا التاريخ غير موجود! يرجى التحقق من الشهر واليوم.", ephemeral=True
+            )
+
+        user_id = str(interaction.user.id)
+        guild_id = str(interaction.guild.id)
+        
+        try:
+            # متوافق مع جدول Neon الخاص بك
+            await self.bot_instance.db.execute("""
+                INSERT INTO birthdays (user_id, guild_id, birth_day, birth_month, timezone, last_wished_year)
+                VALUES ($1, $2, $3, $4, 'Africa/Casablanca', 0)
                 ON CONFLICT (user_id, guild_id) 
-                DO UPDATE SET birth_day = EXCLUDED.birth_day, birth_month = EXCLUDED.birth_month, timezone = EXCLUDED.timezone;
-            """, str(interaction.user.id), str(interaction.guild_id), d, m, user_tz)
+                DO UPDATE SET birth_day = $3, birth_month = $4;
+            """, user_id, guild_id, day, month)
+            
+            await interaction.response.send_message(
+                f"✅ تم تسجيل تاريخ ميلادك بنجاح: **{day:02d}/{month:02d}** 🤍\nسنحتفل بك في هذا اليوم بحول الله!",
+                ephemeral=True
+            )
+        except Exception as e:
+            await interaction.response.send_message(
+                "❌ حدث خطأ أثناء الحفظ في قاعدة البيانات.", ephemeral=True
+            )
+            print(e)
 
-        await interaction.response.send_message(f"✅ تم تسجيل عيد ميلادك بنجاح في {d}/{m} بتوقيت {user_tz}!", ephemeral=True)
-
-class BirthdayView(discord.ui.View):
-    def __init__(self):
+class BirthdayRegisterView(ui.View):
+    def __init__(self, bot_instance):
         super().__init__(timeout=None)
+        self.bot_instance = bot_instance
 
-    @discord.ui.button(label="تسجيل عيد الميلاد 🎂", style=discord.ButtonStyle.blurple, custom_id="setup_birthday_btn")
-    async def birthday_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(BirthdayModal())
-
-@bot.command(name="setup_birthday")
-async def setup_birthday(ctx):
-    embed = discord.Embed(
-        title="Birthday Registration 🎂",
-        description="Want Eternal World to 🤍 celebrate your special day?\n\nاضغط على الزر بالأسفل لتسجيل تاريخ ميلادك مع توقيت بلادك!",
-        color=0xffb6c1
+    @ui.button(
+        label="تسجيل عيد الميلاد 🎂",
+        style=discord.ButtonStyle.secondary,
+        custom_id="register_birthday_btn"
     )
-    embed.set_footer(text="Birthday Star 🌟")
-    view = BirthdayView()
-    await ctx.send(embed=embed, view=view)
+    async def register_button(self, interaction: discord.Interaction, button: ui.Button):
+        await interaction.response.send_modal(BirthdayModal(self.bot_instance))
+
+# ================= 2. أمر !setup_birthday (للمشرفين) =================
+@bot.command(name="setup_birthday")
+@commands.has_permissions(administrator=True)
+async def setup_birthday(ctx: commands.Context):
     try:
         await ctx.message.delete()
-    except:
+    except discord.Forbidden:
         pass
 
+    embed = discord.Embed(
+        title="Birthday Registration 🎂",
+        description=(
+            "Want Eternal World to 🤍 celebrate your special day?\n\n"
+            "اضغط على الزر بالأسفل لتسجيل تاريخ ميلادك!\n\n"
+            "Birthday Star 🌟"
+        ),
+        color=0x2B2D31
+    )
+    await ctx.send(embed=embed, view=BirthdayRegisterView(bot))
 
-# ==================== 2. ADD BIRTHDAY (SURPRISE) WITH TIMEZONE ====================
-@bot.tree.command(name="add_birthday", description="إضافة عيد ميلاد شخص آخر مفاجأة مع تحديد توقيت بلده")
-@app_commands.describe(member="الشخص المعني", day="اليوم (1-31)", month="الشهر (1-12)", timezone="مثال: Asia/Beirut أو Africa/Casablanca")
-async def add_birthday(interaction: discord.Interaction, member: discord.Member, day: int, month: int, timezone: str = "Africa/Casablanca"):
-    if timezone not in available_timezones():
-        await interaction.response.send_message("❌ Timezone غير صحيحة! تأكد من كتابتها بشكل صحيح (مثال: Asia/Beirut)", ephemeral=True)
-        return
+# ================= 3. سلاش كوماند /wish (إرسال تهنئة) =================
+@bot.tree.command(name="wish", description="إرسال تهنئة خاصة لعضو بمناسبة عيد ميلاده 🎂")
+@app_commands.describe(
+    member="اختر العضو الذي ترغب في تهنئته",
+    message="اكتب رسالة التهنئة هنا"
+)
+async def wish_command(interaction: discord.Interaction, member: discord.Member, message: str):
+    if member.bot:
+        return await interaction.response.send_message("❌ لا يمكنك إرسال تهنئة إلى بوت!", ephemeral=True)
 
-    if not (1 <= day <= 31 and 1 <= month <= 12):
-        await interaction.response.send_message("❌ التاريخ غير صحيح!", ephemeral=True)
-        return
+    embed = discord.Embed(
+        title="💌 تهنئة خاصة بمناسبة عيد الميلاد!",
+        description=f"« {message} »",
+        color=0xFFC0CB
+    )
+    embed.set_footer(text=f"من طرف: {interaction.user.display_name}", icon_url=interaction.user.display_avatar.url)
 
-    async with db_pool.acquire() as conn:
-        await conn.execute("""
-            INSERT INTO birthdays (user_id, guild_id, birth_day, birth_month, timezone)
-            VALUES ($1, $2, $3, $4, $5)
+    await interaction.response.send_message(
+        content=f"🎉 {member.mention} وصلتْك تهنئة مميزة من {interaction.user.mention}!",
+        embed=embed
+    )
+
+# ================= 4. سلاش كوماند /set_birthday (متاح للجميع) =================
+@bot.tree.command(name="set_birthday", description="إضافة أو تعديل تاريخ ميلاد أي عضو في السيرفر 📅")
+@app_commands.describe(
+    member="العضو المراد تسجيل عيد ميلاده",
+    day="اليوم (مثال: 15)",
+    month="الشهر (مثال: 8)"
+)
+async def set_birthday_command(interaction: discord.Interaction, member: discord.Member, day: int, month: int):
+    if member.bot:
+        return await interaction.response.send_message("❌ لا يمكنك تسجيل عيد ميلاد للبوتات!", ephemeral=True)
+
+    if not is_valid_date(day, month):
+        return await interaction.response.send_message("❌ هذا التاريخ غير صحيح! يرجى التأكد من اليوم والشهر.", ephemeral=True)
+
+    if not bot.db:
+        return await interaction.response.send_message("❌ قاعدة البيانات غير متصلة حالياً.", ephemeral=True)
+
+    try:
+        user_id = str(member.id)
+        guild_id = str(interaction.guild.id)
+
+        await bot.db.execute("""
+            INSERT INTO birthdays (user_id, guild_id, birth_day, birth_month, timezone, last_wished_year)
+            VALUES ($1, $2, $3, $4, 'Africa/Casablanca', 0)
             ON CONFLICT (user_id, guild_id) 
-            DO UPDATE SET birth_day = EXCLUDED.birth_day, birth_month = EXCLUDED.birth_month, timezone = EXCLUDED.timezone;
-        """, str(member.id), str(interaction.guild_id), day, month, timezone)
+            DO UPDATE SET birth_day = $3, birth_month = $4;
+        """, user_id, guild_id, day, month)
 
-    await interaction.response.send_message(f"🤫 تمت إضافة عيد ميلاد {member.mention} بنجاح في {day}/{month} بتوقيت {timezone} (مفاجأة!)", ephemeral=True)
+        await interaction.response.send_message(
+            f"✅ تم بنجاح تسجيل تاريخ ميلاد العضو {member.mention} في **{day:02d}/{month:02d}** 🎂",
+            ephemeral=True
+        )
+    except Exception as e:
+        await interaction.response.send_message("❌ حدث خطأ أثناء الحفظ في قاعدة البيانات.", ephemeral=True)
+        print(e)
 
-
-# ==================== 3. CUSTOM WISH COMMAND ====================
-@bot.tree.command(name="wish", description="كتابة تهنئة مخصصة لشخص في عيد ميلاده وتطاكيه مع everyone")
-@app_commands.describe(member="صاحب عيد الميلاد", custom_message="التهنئة التي تريد كتابتها", image_url="رابط الصورة")
-async def wish(interaction: discord.Interaction, member: discord.Member, custom_message: str, image_url: str):
-    channel = bot.get_channel(CHANNEL_ID) or interaction.channel
-    content = f"@everyone 🎂 عيد ميلاد سعيد يا نجمنا!\n\n{custom_message}\n\n{member.mention}"
-    
-    await channel.send(content=content)
-    await channel.send(image_url)
-    await interaction.response.send_message("✅ تم إرسال التهنئة بنجاح!", ephemeral=True)
-
-
-# ==================== 4. AUTOMATIC CHECKER HOURLY (BY LOCAL TIME) ====================
-@tasks.loop(hours=1) # Kat-cheki kol sa3a bach t-dir 12:00 dyal lil f kol blasa b zabt
+# ================= 5. الفحص الأوتوماتيكي (منتصف الليل) =================
+@tasks.loop(minutes=1)
 async def check_birthdays():
-    if not db_pool:
+    now = datetime.now(TIMEZONE)
+    if now.hour != 0 or now.minute != 0:
         return
 
-    async with db_pool.acquire() as conn:
-        rows = await conn.fetch("SELECT user_id, guild_id, birth_day, birth_month, timezone, last_wished_year FROM birthdays;")
+    if not bot.db:
+        return
 
-        for row in rows:
-            try:
-                user_tz = ZoneInfo(row['timezone'])
-            except:
-                user_tz = ZoneInfo("Africa/Casablanca") # Default
-                
-            # Now f l-waqt l-maHalli dyal dik l-bnt
-            now_local = datetime.now(user_tz)
-            
-            current_day = now_local.day
-            current_month = now_local.month
-            current_year = now_local.year
-            current_hour = now_local.hour
-            current_minute = now_local.minute
+    channel = bot.get_channel(ANNOUNCEMENT_CHANNEL_ID)
+    if not channel:
+        return
 
-            # Wach l-youm howa 3id miladha W Dba m-zbit 00:00 (12 dyal lil f bladha)?
-            if row['birth_day'] == current_day and row['birth_month'] == current_month:
-                if row['last_wished_year'] == current_year:
-                    continue # Saf tahnia f nafs l-3am
-                
-                # Ntsnaw tal 12:00 wla 12:59 (f awl sa3a f nhar l-3id)
-                if current_hour == 0:
-                    guild = bot.get_guild(int(row['guild_id']))
-                    if not guild:
-                        continue
-                    
-                    member = guild.get_member(int(row['user_id']))
-                    if not member:
-                        try:
-                            member = await guild.fetch_member(int(row['user_id']))
-                        except:
-                            continue
+    guild = channel.guild
+    guild_id = str(guild.id)
 
-                    channel = guild.get_channel(CHANNEL_ID)
-                    if not channel:
-                        for c in guild.text_channels:
-                            if c.permissions_for(guild.me).send_messages:
-                                channel = c
-                                break
+    rows = await bot.db.fetch(
+        "SELECT user_id, birth_day, birth_month, last_wished_year FROM birthdays WHERE guild_id = $1",
+        guild_id
+    )
 
-                    if channel:
-                        text_content = (
-                            f"@everyone 🎂 عيد ميلاد سعيد يا نجمنا!\n\n"
-                            f"اليوم مو يوم عادي في Eternal World، اليوم نحتفل بأحد أفراد عائلتنا! 🤍\n\n"
-                            f"كل عام وأنت بخير، ونتمنى لك سنة جديدة مليئة بالأيام الجميلة، والتجارب التي تستحق أن تُعاش، والذكريات التي تستحق أن تبقى.\n\n"
-                            f"نحن سعداء بوجودك بيننا، ونتمنى أن يحمل لك عامك الجديد الكثير مما تحب وتتمنى.\n\n"
-                            f"استمتع بيومك، فأنت نجم احتفالنا اليوم! ✨\n\n"
-                            f"من عائلة Eternal World، بكل الحب. 🤍\n\n"
-                            f"{member.mention}"
-                        )
-                        
-                        # Tswira dyal l-qetat (bdelha ila bghiti b rabet akhor)
-                        image_link = "https://images-ext-1.discordapp.net/external/..." 
-                        
-                        await channel.send(text_content)
-                        await channel.send(image_link)
+    for row in rows:
+        user_id = row["user_id"]
+        day = row["birth_day"]
+        month = row["birth_month"]
+        last_wished_year = row["last_wished_year"]
 
-                        # Update last wished year
-                        await conn.execute("""
-                            UPDATE birthdays SET last_wished_year = $1 
-                            WHERE user_id = $2 AND guild_id = $3;
-                        """, current_year, row['user_id'], row['guild_id'])
+        member = guild.get_member(int(user_id))
+        if not member:
+            continue
+
+        is_today = (day == now.day and month == now.month)
+
+        if is_today and last_wished_year != now.year:
+            await bot.db.execute(
+                "UPDATE birthdays SET last_wished_year = $1 WHERE user_id = $2 AND guild_id = $3",
+                now.year, user_id, guild_id
+            )
+
+            birthday_text = (
+                "🎂 عيد ميلاد سعيد يا نجمنا!\n\n"
+                "اليوم ليس يوماً عادياً في Eternal World، اليوم نحتفل بأحد أعضاء عائلتنا الغالية! 🤍\n\n"
+                "كل عام وأنت بخير، ونتمنى لك سنة جديدة مليئة بالأيام الجميلة، والتجارب التي تستحق أن تُعاش، والذكريات التي تستحق أن تبقى.\n\n"
+                "نحن سعداء بوجودك بيننا، ونتمنى أن يحمل لك عامك الجديد الكثير مما تحب وتتمنى.\n\n"
+                "استمتع بيومك، فأنت نجم احتفالنا اليوم! ✨\n\n"
+                "من عائلة Eternal World، بكل الحب. 🤍"
+            )
+
+            embed = discord.Embed(
+                description=birthday_text,
+                color=0xFFC0CB
+            )
+
+            content_mentions = f"@everyone | {member.mention}"
+
+            if os.path.exists(IMAGE_FILENAME):
+                file = discord.File(IMAGE_FILENAME, filename="happy_birthday.jpg")
+                embed.set_image(url="attachment://happy_birthday.jpg")
+                await channel.send(content=content_mentions, embed=embed, file=file)
+            else:
+                await channel.send(content=content_mentions, embed=embed)
 
 @check_birthdays.before_loop
 async def before_check():
     await bot.wait_until_ready()
 
-TOKEN = os.getenv("TOKEN")
+@bot.event
+async def on_ready():
+    print(f"✅ البوت يعمل الآن باسم: {bot.user}")
+    if not check_birthdays.is_running():
+        check_birthdays.start()
+
 bot.run(TOKEN)
-  
+        
