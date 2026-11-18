@@ -41,7 +41,7 @@ def is_valid_date(day: int, month: int) -> bool:
     except ValueError:
         return False
 
-# ================= 1. قائمة اختيار الدول والمنطقة الزمنية =================
+# ================= 1. قائمة اختيار الدول والمنطقة الزمنية (للتسجيل) =================
 class TimezoneSelect(ui.Select):
     def __init__(self, bot_instance, day: int, month: int):
         self.bot_instance = bot_instance
@@ -153,15 +153,10 @@ class BirthdayRegisterView(ui.View):
     )
     async def register_button(self, interaction: discord.Interaction, button: ui.Button):
         await interaction.response.send_modal(BirthdayModal(self.bot_instance))
-        # ================= 3. أمر !setup_birthday (للمشرفين) =================
-@bot.command(name="setup_birthday")
-@commands.has_permissions(administrator=True)
-async def setup_birthday(ctx: commands.Context):
-    try:
-        await ctx.message.delete()
-    except discord.Forbidden:
-        pass
-
+        # ================= 3. سلاش كوماند /setup_birthday (للمشرفين) =================
+@bot.tree.command(name="setup_birthday", description="إرسال رسالة تسجيل أعياد الميلاد للأعضاء 🎂")
+@app_commands.checks.has_permissions(administrator=True)
+async def setup_birthday_slash(interaction: discord.Interaction):
     embed = discord.Embed(
         title="Birthday Registration 🎂",
         description=(
@@ -171,7 +166,7 @@ async def setup_birthday(ctx: commands.Context):
         ),
         color=0x2B2D31
     )
-    await ctx.send(embed=embed, view=BirthdayRegisterView(bot))
+    await interaction.response.send_message(embed=embed, view=BirthdayRegisterView(bot), ephemeral=False)
 
 # ================= 4. سلاش كوماند /wish =================
 @bot.tree.command(name="wish", description="إرسال تهنئة خاصة لعضو بمناسبة عيد ميلاده 🎂")
@@ -240,42 +235,78 @@ async def set_birthday_command(interaction: discord.Interaction, member: discord
         await interaction.response.send_message("❌ حدث خطأ أثناء الحفظ.", ephemeral=True)
         print(e)
 
-# ================= 6. سلاش كوماند /change_birthday =================
-@bot.tree.command(name="change_birthday", description="تعديل وتغيير تاريخ ميلادك المسجل مسبقاً 🔄")
+# ================= 6. سلاش كوماند /change_birthday (مع اختيار المنطقة الزمنية) =================
+class ChangeTimezoneSelect(ui.Select):
+    def __init__(self, bot_instance, day: int, month: int):
+        self.bot_instance = bot_instance
+        self.day = day
+        self.month = month
+
+        options = [
+            discord.SelectOption(label="المغرب", value="Africa/Casablanca", emoji="🇲🇦"),
+            discord.SelectOption(label="السعودية", value="Asia/Riyadh", emoji="🇸🇦"),
+            discord.SelectOption(label="الإمارات", value="Asia/Dubai", emoji="🇦🇪"),
+            discord.SelectOption(label="لبنان", value="Asia/Beirut", emoji="🇱🇧"),
+            discord.SelectOption(label="الجزائر", value="Africa/Algiers", emoji="🇩🇿"),
+            discord.SelectOption(label="تونس", value="Africa/Tunis", emoji="🇹🇳"),
+            discord.SelectOption(label="العراق", value="Asia/Baghdad", emoji="🇮🇶"),
+            discord.SelectOption(label="سوريا", value="Asia/Damascus", emoji="🇸🇾"),
+            discord.SelectOption(label="الأردن", value="Asia/Amman", emoji="🇯🇴"),
+            discord.SelectOption(label="فلسطين", value="Asia/Jerusalem", emoji="🇵🇸"),
+            discord.SelectOption(label="مصر", value="Africa/Cairo", emoji="🇪🇬"),
+            discord.SelectOption(label="توقيت غرينتش (UTC)", value="UTC", emoji="🌍")
+        ]
+        super().__init__(placeholder="اختر دولتك الجديدة...", min_values=1, max_values=1, options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        selected_timezone = self.values[0]
+        user_id = str(interaction.user.id)
+        guild_id = str(interaction.guild.id)
+
+        try:
+            result = await self.bot_instance.db.execute("""
+                UPDATE birthdays 
+                SET birth_day = $1, birth_month = $2, timezone = $3
+                WHERE user_id = $4 AND guild_id = $5
+            """, self.day, self.month, selected_timezone, user_id, guild_id)
+
+            if result == "UPDATE 0":
+                await self.bot_instance.db.execute("""
+                    INSERT INTO birthdays (user_id, guild_id, birth_day, birth_month, timezone, last_wished_year)
+                    VALUES ($1, $2, $3, $4, $5, 0)
+                """, user_id, guild_id, self.day, self.month, selected_timezone)
+
+            await interaction.response.edit_message(
+                content=f"✅ تم تحديث تاريخ ميلادك إلى **{self.day:02d}/{self.month:02d}** وتحديد دولتك بنجاح! 🔄🎂",
+                view=None
+            )
+        except Exception as e:
+            await interaction.response.send_message("❌ حدث خطأ أثناء التحديث في قاعدة البيانات.", ephemeral=True)
+            print(e)
+
+class ChangeTimezoneView(ui.View):
+    def __init__(self, bot_instance, day: int, month: int):
+        super().__init__(timeout=60)
+        self.add_item(ChangeTimezoneSelect(bot_instance, day, month))
+
+@bot.tree.command(name="change_birthday", description="تعديل وتغيير تاريخ ميلادك ودولتك 🔄")
 @app_commands.describe(
     day="اليوم الجديد",
     month="الشهر الجديد"
 )
 async def change_birthday_command(interaction: discord.Interaction, day: int, month: int):
     if not is_valid_date(day, month):
-        return await interaction.response.send_message("❌ هذا التاريخ غير صحيح!", ephemeral=True)
+        return await interaction.response.send_message("❌ هذا التاريخ غير صحيح! يرجى التأكد.", ephemeral=True)
 
     if not bot.db:
         return await interaction.response.send_message("❌ قاعدة البيانات غير متصلة حالياً.", ephemeral=True)
 
-    user_id = str(interaction.user.id)
-    guild_id = str(interaction.guild.id)
-
-    try:
-        result = await bot.db.execute("""
-            UPDATE birthdays 
-            SET birth_day = $1, birth_month = $2 
-            WHERE user_id = $3 AND guild_id = $4
-        """, day, month, user_id, guild_id)
-
-        if result == "UPDATE 0":
-            return await interaction.response.send_message(
-                "❌ ليس لديك تاريخ ميلاد مسجل أصلاً!",
-                ephemeral=True
-            )
-
-        await interaction.response.send_message(
-            f"✅ تم تحديث تاريخ ميلادك بنجاح إلى: **{day:02d}/{month:02d}** 🔄",
-            ephemeral=True
-        )
-    except Exception as e:
-        await interaction.response.send_message("❌ حدث خطأ أثناء التعديل.", ephemeral=True)
-        print(e)
+    view = ChangeTimezoneView(bot, day, month)
+    await interaction.response.send_message(
+        f"📅 التاريخ الجديد المُدخل: **{day:02d}/{month:02d}**.\nالمرجو **اختيار دولتك** من القائمة أدناه لتحديث التوقيت بدقة:",
+        view=view,
+        ephemeral=True
+    )
 
 # ================= 7. الفحص الأوتوماتيكي (حسب توقيت كل دولة) =================
 @tasks.loop(minutes=1)
