@@ -10,6 +10,7 @@ import asyncpg
 TOKEN = os.getenv("DISCORD_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 CHANNEL_ID = int(os.getenv("CHANNEL_ID", "0"))
+OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 IMAGE_FILENAME = "birthday_banner.jpg"
 # ===============================================================
 
@@ -153,7 +154,7 @@ class BirthdayRegisterView(ui.View):
     )
     async def register_button(self, interaction: discord.Interaction, button: ui.Button):
         await interaction.response.send_modal(BirthdayModal(self.bot_instance))
-        # ================= 3. سلاش كوماند /setup_birthday (للمشرفين) =================
+        # ================= 3. سلاش كوماند /setup_birthday (خاص بالمشرفين) =================
 @bot.tree.command(name="setup_birthday", description="إرسال رسالة تسجيل أعياد الميلاد للأعضاء 🎂")
 @app_commands.checks.has_permissions(administrator=True)
 async def setup_birthday_slash(interaction: discord.Interaction):
@@ -308,7 +309,47 @@ async def change_birthday_command(interaction: discord.Interaction, day: int, mo
         ephemeral=True
     )
 
-# ================= 7. الفحص الأوتوماتيكي (حسب توقيت كل دولة) =================
+# ================= 7. سلاش كوماند /birthday_list (خاص بـ OWNER_ID فقط) =================
+@bot.tree.command(name="birthday_list", description="عرض لائحة جميع الأعضاء المسجلين في أعياد الميلاد 📋")
+async def birthday_list_command(interaction: discord.Interaction):
+    if OWNER_ID == 0 or interaction.user.id != OWNER_ID:
+        return await interaction.response.send_message("❌ هذا الأمر مخصص لصاحب البوت فقط.", ephemeral=True)
+
+    if not bot.db:
+        return await interaction.response.send_message("❌ قاعدة البيانات غير متصلة حالياً.", ephemeral=True)
+
+    guild_id = str(interaction.guild.id)
+
+    rows = await bot.db.fetch(
+        "SELECT user_id, birth_day, birth_month, timezone FROM birthdays WHERE guild_id = $1 ORDER BY birth_month, birth_day",
+        guild_id
+    )
+
+    if not rows:
+        return await interaction.response.send_message("📭 لا يوجد أي عضو مسجل في قاعدة بيانات أعياد الميلاد حتى الآن.", ephemeral=True)
+
+    description_lines = []
+    for row in rows:
+        user_id = row["user_id"]
+        day = row["birth_day"]
+        month = row["birth_month"]
+        tz = row["timezone"]
+
+        member = interaction.guild.get_member(int(user_id))
+        name = member.mention if member else f"مستخدم مغادر (`{user_id}`)"
+
+        description_lines.append(f"🎂 {name} ⟵ **{day:02d}/{month:02d}** (التوقيت: `{tz}`)")
+
+    embed = discord.Embed(
+        title="📋 لائحة أعياد ميلاد أعضاء Eternal World",
+        description="\n".join(description_lines),
+        color=0xFFC0CB
+    )
+    embed.set_footer(text=f"إجمالي المسجلين: {len(rows)} عضو")
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+# ================= 8. الفحص الأوتوماتيكي (حسب توقيت كل دولة) =================
 @tasks.loop(minutes=1)
 async def check_birthdays():
     if not bot.db:
