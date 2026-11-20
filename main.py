@@ -428,6 +428,45 @@ async def check_birthdays():
 async def before_check():
     await bot.wait_until_ready()
 
+# ================= إرسال تهنئة فورية في روم محدد (للأونر فقط) =================
+TARGET_CHANNEL_ID = 1569523433514205254  # حطي هنا ID ديال الروم اللي بغيتي توصل فيه هاد التهنئة (أرقام فقط)
+
+@bot.tree.command(name="send_birthday_now", description="إرسال تهنئة عيد الميلاد الكاملة فوراً في الروم المحدد (للأونر فقط) 🎂")
+@app_commands.describe(member="العضوة اللي بغيتي تهنّيها دابا")
+async def send_birthday_now_command(interaction: discord.Interaction, member: discord.Member):
+    if OWNER_ID == 0 or interaction.user.id != OWNER_ID:
+        return await interaction.response.send_message("❌ هذا الأمر مخصص لصاحب البوت فقط.", ephemeral=True)
+
+    channel = bot.get_channel(TARGET_CHANNEL_ID) if TARGET_CHANNEL_ID else None
+    if not channel:
+        return await interaction.response.send_message("❌ تأكدي من وضع `TARGET_CHANNEL_ID` صحيح أو أن البوت يقدر يشوف هاد الروم.", ephemeral=True)
+
+    birthday_text = (
+        "🎂 عيد ميلاد سعيد يا نجمنا!\n\n"
+        "اليوم ليس يوماً عادياً في Eternal World، اليوم نحتفل بأحد أعضاء عائلتنا الغالية! 🤍\n\n"
+        "كل عام وأنت بخير، ونتمنى لك سنة جديدة مليئة بالأيام الجميلة، والتجارب التي تستحق أن تُعاش، والذكريات التي تستحق أن تبقى.\n\n"
+        "نحن سعداء بوجودك بيننا، ونتمنى أن يحمل لك عامك الجديد الكثير مما تحب وتتمنى.\n\n"
+        "استمتع بيومك، فأنت نجم احتفالنا اليوم! ✨\n\n"
+        "من عائلة Eternal World، بكل الحب. 🤍"
+    )
+
+    embed = discord.Embed(
+        description=birthday_text,
+        color=0xFFC0CB
+    )
+
+    content_mentions = f"@everyone | {member.mention}"
+
+    await interaction.response.send_message(f"✅ تم إرسال التهنئة لـ {member.mention} في {channel.mention}.", ephemeral=True)
+
+    if os.path.exists(IMAGE_FILENAME):
+        file = discord.File(IMAGE_FILENAME, filename="happy_birthday.jpg")
+        embed.set_image(url="attachment://happy_birthday.jpg")
+        await channel.send(content=content_mentions, embed=embed, file=file)
+    else:
+        await channel.send(content=content_mentions, embed=embed)
+    
+
 @bot.event
 async def on_ready():
     print(f"✅ البوت يعمل الآن باسم: {bot.user}")
