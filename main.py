@@ -23,9 +23,16 @@ class BirthdayBot(commands.Bot):
         super().__init__(command_prefix="!", intents=intents)
         self.db = None
 
+    async def ensure_db(self):
+        if not DATABASE_URL:
+            raise RuntimeError("DATABASE_URL is not set")
+        if self.db is None or self.db.is_closed():
+            self.db = await asyncpg.connect(DATABASE_URL)
+        return self.db
+
     async def setup_hook(self):
         try:
-            self.db = await asyncpg.connect(DATABASE_URL)
+            await self.ensure_db()
             print("✅ تم الاتصال بقاعدة البيانات بنجاح!")
         except Exception as e:
             print(f"❌ خطأ في الاتصال بقاعدة البيانات: {e}")
@@ -71,7 +78,8 @@ class TimezoneSelect(ui.Select):
         guild_id = str(interaction.guild.id)
 
         try:
-            existing = await self.bot_instance.db.fetchrow(
+            db = await self.bot_instance.ensure_db()
+            existing = await db.fetchrow(
                 "SELECT birth_day, birth_month FROM birthdays WHERE user_id = $1 AND guild_id = $2",
                 user_id, guild_id
             )
@@ -82,7 +90,7 @@ class TimezoneSelect(ui.Select):
                     ephemeral=True
                 )
 
-            await self.bot_instance.db.execute("""
+            await db.execute("""
                 INSERT INTO birthdays (user_id, guild_id, birth_day, birth_month, timezone, last_wished_year)
                 VALUES ($1, $2, $3, $4, $5, 0)
             """, user_id, guild_id, self.day, self.month, selected_timezone)
@@ -93,7 +101,7 @@ class TimezoneSelect(ui.Select):
             )
         except Exception as e:
             await interaction.response.send_message("❌ حدث خطأ أثناء الحفظ في قاعدة البيانات.", ephemeral=True)
-            print(e)
+            print("Register DB error:", e)
 
 class TimezoneView(ui.View):
     def __init__(self, bot_instance, day: int, month: int):
@@ -205,14 +213,12 @@ async def set_birthday_command(interaction: discord.Interaction, member: discord
     if not is_valid_date(day, month):
         return await interaction.response.send_message("❌ هذا التاريخ غير صحيح! يرجى التأكد.", ephemeral=True)
 
-    if not bot.db:
-        return await interaction.response.send_message("❌ قاعدة البيانات غير متصلة حالياً.", ephemeral=True)
-
     try:
+        db = await bot.ensure_db()
         user_id = str(member.id)
         guild_id = str(interaction.guild.id)
 
-        existing = await bot.db.fetchrow(
+        existing = await db.fetchrow(
             "SELECT birth_day, birth_month FROM birthdays WHERE user_id = $1 AND guild_id = $2",
             user_id, guild_id
         )
@@ -223,7 +229,7 @@ async def set_birthday_command(interaction: discord.Interaction, member: discord
                 ephemeral=True
             )
 
-        await bot.db.execute("""
+        await db.execute("""
             INSERT INTO birthdays (user_id, guild_id, birth_day, birth_month, timezone, last_wished_year)
             VALUES ($1, $2, $3, $4, 'Africa/Casablanca', 0)
         """, user_id, guild_id, day, month)
@@ -234,7 +240,7 @@ async def set_birthday_command(interaction: discord.Interaction, member: discord
         )
     except Exception as e:
         await interaction.response.send_message("❌ حدث خطأ أثناء الحفظ.", ephemeral=True)
-        print(e)
+        print("Set birthday DB error:", e)
 
 # ================= 6. سلاش كوماند /change_birthday (مع اختيار المنطقة الزمنية) =================
 class ChangeTimezoneSelect(ui.Select):
@@ -265,14 +271,15 @@ class ChangeTimezoneSelect(ui.Select):
         guild_id = str(interaction.guild.id)
 
         try:
-            result = await self.bot_instance.db.execute("""
+            db = await self.bot_instance.ensure_db()
+            result = await db.execute("""
                 UPDATE birthdays 
                 SET birth_day = $1, birth_month = $2, timezone = $3
                 WHERE user_id = $4 AND guild_id = $5
             """, self.day, self.month, selected_timezone, user_id, guild_id)
 
             if result == "UPDATE 0":
-                await self.bot_instance.db.execute("""
+                await db.execute("""
                     INSERT INTO birthdays (user_id, guild_id, birth_day, birth_month, timezone, last_wished_year)
                     VALUES ($1, $2, $3, $4, $5, 0)
                 """, user_id, guild_id, self.day, self.month, selected_timezone)
@@ -283,7 +290,7 @@ class ChangeTimezoneSelect(ui.Select):
             )
         except Exception as e:
             await interaction.response.send_message("❌ حدث خطأ أثناء التحديث في قاعدة البيانات.", ephemeral=True)
-            print(e)
+            print("Change birthday DB error:", e)
 
 class ChangeTimezoneView(ui.View):
     def __init__(self, bot_instance, day: int, month: int):
@@ -299,9 +306,6 @@ async def change_birthday_command(interaction: discord.Interaction, day: int, mo
     if not is_valid_date(day, month):
         return await interaction.response.send_message("❌ هذا التاريخ غير صحيح! يرجى التأكد.", ephemeral=True)
 
-    if not bot.db:
-        return await interaction.response.send_message("❌ قاعدة البيانات غير متصلة حالياً.", ephemeral=True)
-
     view = ChangeTimezoneView(bot, day, month)
     await interaction.response.send_message(
         f"📅 التاريخ الجديد المُدخل: **{day:02d}/{month:02d}**.\nالمرجو **اختيار دولتك** من القائمة أدناه لتحديث التوقيت بدقة:",
@@ -315,107 +319,110 @@ async def birthday_list_command(interaction: discord.Interaction):
     if OWNER_ID == 0 or interaction.user.id != OWNER_ID:
         return await interaction.response.send_message("❌ هذا الأمر مخصص لصاحب البوت فقط.", ephemeral=True)
 
-    if not bot.db:
-        return await interaction.response.send_message("❌ قاعدة البيانات غير متصلة حالياً.", ephemeral=True)
+    try:
+        db = await bot.ensure_db()
+        guild_id = str(interaction.guild.id)
 
-    guild_id = str(interaction.guild.id)
+        rows = await db.fetch(
+            "SELECT user_id, birth_day, birth_month, timezone FROM birthdays WHERE guild_id = $1 ORDER BY birth_month, birth_day",
+            guild_id
+        )
 
-    rows = await bot.db.fetch(
-        "SELECT user_id, birth_day, birth_month, timezone FROM birthdays WHERE guild_id = $1 ORDER BY birth_month, birth_day",
-        guild_id
-    )
+        if not rows:
+            return await interaction.response.send_message("📭 لا يوجد أي عضو مسجل في قاعدة بيانات أعياد الميلاد حتى الآن.", ephemeral=True)
 
-    if not rows:
-        return await interaction.response.send_message("📭 لا يوجد أي عضو مسجل في قاعدة بيانات أعياد الميلاد حتى الآن.", ephemeral=True)
+        description_lines = []
+        for row in rows:
+            user_id = row["user_id"]
+            day = row["birth_day"]
+            month = row["birth_month"]
+            tz = row["timezone"]
 
-    description_lines = []
-    for row in rows:
-        user_id = row["user_id"]
-        day = row["birth_day"]
-        month = row["birth_month"]
-        tz = row["timezone"]
+            member = interaction.guild.get_member(int(user_id))
+            name = member.mention if member else f"مستخدم مغادر (`{user_id}`)"
 
-        member = interaction.guild.get_member(int(user_id))
-        name = member.mention if member else f"مستخدم مغادر (`{user_id}`)"
+            description_lines.append(f"🎂 {name} ⟵ **{day:02d}/{month:02d}** (التوقيت: `{tz}`)")
 
-        description_lines.append(f"🎂 {name} ⟵ **{day:02d}/{month:02d}** (التوقيت: `{tz}`)")
+        embed = discord.Embed(
+            title="📋 لائحة أعياد ميلاد أعضاء Eternal World",
+            description="\n".join(description_lines),
+            color=0xFFC0CB
+        )
+        embed.set_footer(text=f"إجمالي المسجلين: {len(rows)} عضو")
 
-    embed = discord.Embed(
-        title="📋 لائحة أعياد ميلاد أعضاء Eternal World",
-        description="\n".join(description_lines),
-        color=0xFFC0CB
-    )
-    embed.set_footer(text=f"إجمالي المسجلين: {len(rows)} عضو")
-
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+    except Exception as e:
+        await interaction.response.send_message("❌ حدث خطأ أثناء جلب اللائحة من قاعدة البيانات.", ephemeral=True)
+        print("Birthday list DB error:", e)
 
 # ================= 8. الفحص الأوتوماتيكي (حسب توقيت كل دولة) =================
 @tasks.loop(minutes=1)
 async def check_birthdays():
-    if not bot.db:
-        return
-
     channel = bot.get_channel(CHANNEL_ID)
     if not channel:
         return
 
-    guild = channel.guild
-    guild_id = str(guild.id)
+    try:
+        db = await bot.ensure_db()
+        guild = channel.guild
+        guild_id = str(guild.id)
 
-    rows = await bot.db.fetch(
-        "SELECT user_id, birth_day, birth_month, timezone, last_wished_year FROM birthdays WHERE guild_id = $1",
-        guild_id
-    )
+        rows = await db.fetch(
+            "SELECT user_id, birth_day, birth_month, timezone, last_wished_year FROM birthdays WHERE guild_id = $1",
+            guild_id
+        )
 
-    for row in rows:
-        user_id = row["user_id"]
-        day = row["birth_day"]
-        month = row["birth_month"]
-        tz_name = row["timezone"] or "Africa/Casablanca"
-        last_wished_year = row["last_wished_year"]
+        for row in rows:
+            user_id = row["user_id"]
+            day = row["birth_day"]
+            month = row["birth_month"]
+            tz_name = row["timezone"] or "Africa/Casablanca"
+            last_wished_year = row["last_wished_year"]
 
-        try:
-            user_tz = pytz.timezone(tz_name)
-        except pytz.UnknownTimeZoneError:
-            user_tz = pytz.timezone("Africa/Casablanca")
+            try:
+                user_tz = pytz.timezone(tz_name)
+            except pytz.UnknownTimeZoneError:
+                user_tz = pytz.timezone("Africa/Casablanca")
 
-        now_user = datetime.now(user_tz)
+            now_user = datetime.now(user_tz)
 
-        if now_user.hour == 0 and now_user.minute == 0:
-            member = guild.get_member(int(user_id))
-            if not member:
-                continue
+            if now_user.hour == 0 and now_user.minute == 0:
+                member = guild.get_member(int(user_id))
+                if not member:
+                    continue
 
-            is_today = (day == now_user.day and month == now_user.month)
+                is_today = (day == now_user.day and month == now_user.month)
 
-            if is_today and last_wished_year != now_user.year:
-                await bot.db.execute(
-                    "UPDATE birthdays SET last_wished_year = $1 WHERE user_id = $2 AND guild_id = $3",
-                    now_user.year, user_id, guild_id
-                )
+                if is_today and last_wished_year != now_user.year:
+                    await db.execute(
+                        "UPDATE birthdays SET last_wished_year = $1 WHERE user_id = $2 AND guild_id = $3",
+                        now_user.year, user_id, guild_id
+                    )
 
-                birthday_text = (
-                    "🎂 عيد ميلاد سعيد يا نجمنا!\n\n"
-                    "اليوم ليس يوماً عادياً في Eternal World، اليوم نحتفل بأحد أعضاء عائلتنا الغالية! 🤍\n\n"
-                    "كل عام وأنت بخير، ونتمنى لك سنة جديدة مليئة بالأيام الجميلة، والتجارب التي تستحق أن تُعاش، والذكريات التي تستحق أن تبقى.\n\n"
-                    "نحن سعداء بوجودك بيننا، ونتمنى أن يحمل لك عامك الجديد الكثير مما تحب وتتمنى.\n\n"
-                    "استمتع بيومك، فأنت نجم احتفالنا اليوم! ✨\n\n"
-                    "من عائلة Eternal World، بكل الحب. 🤍"
-                )
+                    birthday_text = (
+                        "🎂 عيد ميلاد سعيد يا نجمنا!\n\n"
+                        "اليوم ليس يوماً عادياً في Eternal World، اليوم نحتفل بأحد أعضاء عائلتنا الغالية! 🤍\n\n"
+                        "كل عام وأنت بخير، ونتمنى لك سنة جديدة مليئة بالأيام الجميلة، والتجارب التي تستحق أن تُعاش، والذكريات التي تستحق أن تبقى.\n\n"
+                        "نحن سعداء بوجودك بيننا، ونتمنى أن يحمل لك عامك الجديد الكثير مما تحب وتتمنى.\n\n"
+                        "استمتع بيومك، فأنت نجم احتفالنا اليوم! ✨\n\n"
+                        "من عائلة Eternal World، بكل الحب. 🤍"
+                    )
 
-                embed = discord.Embed(
-                    description=birthday_text,
-                    color=0xFFC0CB
-                )
+                    embed = discord.Embed(
+                        description=birthday_text,
+                        color=0xFFC0CB
+                    )
 
-                content_mentions = f"@everyone | {member.mention}"
+                    content_mentions = f"@everyone | {member.mention}"
 
-                if os.path.exists(IMAGE_FILENAME):
-                    file = discord.File(IMAGE_FILENAME, filename="happy_birthday.jpg")
-                    embed.set_image(url="attachment://happy_birthday.jpg")
-                    await channel.send(content=content_mentions, embed=embed, file=file)
-                else:
-                    await channel.send(content=content_mentions, embed=embed)
+                    if os.path.exists(IMAGE_FILENAME):
+                        file = discord.File(IMAGE_FILENAME, filename="happy_birthday.jpg")
+                        embed.set_image(url="attachment://happy_birthday.jpg")
+                        await channel.send(content=content_mentions, embed=embed, file=file)
+                    else:
+                        await channel.send(content=content_mentions, embed=embed)
+    except Exception as e:
+        print("Check birthdays loop error:", e)
 
 @check_birthdays.before_loop
 async def before_check():
@@ -428,4 +435,4 @@ async def on_ready():
         check_birthdays.start()
 
 bot.run(TOKEN)
-    
+        
