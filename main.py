@@ -162,7 +162,7 @@ class BirthdayRegisterView(ui.View):
     )
     async def register_button(self, interaction: discord.Interaction, button: ui.Button):
         await interaction.response.send_modal(BirthdayModal(self.bot_instance))
-        # ================= 3. سلاش كوماند /setup_birthday (خاص بالمشرفين) =================
+# ================= 3. سلاش كوماند /setup_birthday (خاص بالمشرفين) =================
 @bot.tree.command(name="setup_birthday", description="إرسال رسالة تسجيل أعياد الميلاد للأعضاء 🎂")
 @app_commands.checks.has_permissions(administrator=True)
 async def setup_birthday_slash(interaction: discord.Interaction):
@@ -274,7 +274,7 @@ class ChangeTimezoneSelect(ui.Select):
             db = await self.bot_instance.ensure_db()
             result = await db.execute("""
                 UPDATE birthdays 
-                SET birth_day = $1, birth_month = $2, timezone = $3
+                SET birth_day = $1, birth_month = $2, timezone = $3, last_wished_year = 0
                 WHERE user_id = $4 AND guild_id = $5
             """, self.day, self.month, selected_timezone, user_id, guild_id)
 
@@ -355,7 +355,7 @@ async def birthday_list_command(interaction: discord.Interaction):
         await interaction.response.send_message("❌ حدث خطأ أثناء جلب اللائحة من قاعدة البيانات.", ephemeral=True)
         print("Birthday list DB error:", e)
 
-# ================= 8. الفحص الأوتوماتيكي (حسب توقيت كل دولة) =================
+# ================= 8. الفحص الأوتوماتيكي (حسب توقيت كل دولة + أمان ضد RESUME) =================
 @tasks.loop(minutes=1)
 async def check_birthdays():
     channel = bot.get_channel(CHANNEL_ID)
@@ -386,41 +386,41 @@ async def check_birthdays():
 
             now_user = datetime.now(user_tz)
 
-            if now_user.hour == 0 and now_user.minute == 0:
+            is_midnight_window = (now_user.hour == 0)
+            is_today = (day == now_user.day and month == now_user.month)
+
+            if is_midnight_window and is_today and last_wished_year != now_user.year:
                 member = guild.get_member(int(user_id))
                 if not member:
                     continue
 
-                is_today = (day == now_user.day and month == now_user.month)
+                birthday_text = (
+                    "🎂 عيد ميلاد سعيد يا نجمنا!\n\n"
+                    "اليوم ليس يوماً عادياً في Eternal World، اليوم نحتفل بأحد أعضاء عائلتنا الغالية! 🤍\n\n"
+                    "كل عام وأنت بخير، ونتمنى لك سنة جديدة مليئة بالأيام الجميلة، والتجارب التي تستحق أن تُعاش، والذكريات التي تستحق أن تبقى.\n\n"
+                    "نحن سعداء بوجودك بيننا، ونتمنى أن يحمل لك عامك الجديد الكثير مما تحب وتتمنى.\n\n"
+                    "استمتع بيومك، فأنت نجم احتفالنا اليوم! ✨\n\n"
+                    "من عائلة Eternal World، بكل الحب. 🤍"
+                )
 
-                if is_today and last_wished_year != now_user.year:
-                    await db.execute(
-                        "UPDATE birthdays SET last_wished_year = $1 WHERE user_id = $2 AND guild_id = $3",
-                        now_user.year, user_id, guild_id
-                    )
+                embed = discord.Embed(
+                    description=birthday_text,
+                    color=0xFFC0CB
+                )
 
-                    birthday_text = (
-                        "🎂 عيد ميلاد سعيد يا نجمنا!\n\n"
-                        "اليوم ليس يوماً عادياً في Eternal World، اليوم نحتفل بأحد أعضاء عائلتنا الغالية! 🤍\n\n"
-                        "كل عام وأنت بخير، ونتمنى لك سنة جديدة مليئة بالأيام الجميلة، والتجارب التي تستحق أن تُعاش، والذكريات التي تستحق أن تبقى.\n\n"
-                        "نحن سعداء بوجودك بيننا، ونتمنى أن يحمل لك عامك الجديد الكثير مما تحب وتتمنى.\n\n"
-                        "استمتع بيومك، فأنت نجم احتفالنا اليوم! ✨\n\n"
-                        "من عائلة Eternal World، بكل الحب. 🤍"
-                    )
+                content_mentions = f"@everyone | {member.mention}"
 
-                    embed = discord.Embed(
-                        description=birthday_text,
-                        color=0xFFC0CB
-                    )
+                if os.path.exists(IMAGE_FILENAME):
+                    file = discord.File(IMAGE_FILENAME, filename="happy_birthday.jpg")
+                    embed.set_image(url="attachment://happy_birthday.jpg")
+                    await channel.send(content=content_mentions, embed=embed, file=file)
+                else:
+                    await channel.send(content=content_mentions, embed=embed)
 
-                    content_mentions = f"@everyone | {member.mention}"
-
-                    if os.path.exists(IMAGE_FILENAME):
-                        file = discord.File(IMAGE_FILENAME, filename="happy_birthday.jpg")
-                        embed.set_image(url="attachment://happy_birthday.jpg")
-                        await channel.send(content=content_mentions, embed=embed, file=file)
-                    else:
-                        await channel.send(content=content_mentions, embed=embed)
+                await db.execute(
+                    "UPDATE birthdays SET last_wished_year = $1 WHERE user_id = $2 AND guild_id = $3",
+                    now_user.year, user_id, guild_id
+                )
     except Exception as e:
         print("Check birthdays loop error:", e)
 
@@ -428,7 +428,7 @@ async def check_birthdays():
 async def before_check():
     await bot.wait_until_ready()
 
-# ================= إرسال تهنئة فورية في روم محدد (للأونر فقط) =================
+# ================= 9. إرسال تهنئة فورية في روم محدد (للأونر فقط) =================
 TARGET_CHANNEL_ID = 1569523433514205254  # حطي هنا ID ديال الروم اللي بغيتي توصل فيه هاد التهنئة (أرقام فقط)
 
 @bot.tree.command(name="send_birthday_now", description="إرسال تهنئة عيد الميلاد الكاملة فوراً في الروم المحدد (للأونر فقط) 🎂")
@@ -465,7 +465,6 @@ async def send_birthday_now_command(interaction: discord.Interaction, member: di
         await channel.send(content=content_mentions, embed=embed, file=file)
     else:
         await channel.send(content=content_mentions, embed=embed)
-    
 
 @bot.event
 async def on_ready():
@@ -474,4 +473,4 @@ async def on_ready():
         check_birthdays.start()
 
 bot.run(TOKEN)
-        
+                                                       
