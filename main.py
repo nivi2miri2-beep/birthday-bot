@@ -162,6 +162,7 @@ class BirthdayRegisterView(ui.View):
     )
     async def register_button(self, interaction: discord.Interaction, button: ui.Button):
         await interaction.response.send_modal(BirthdayModal(self.bot_instance))
+
 # ================= 3. سلاش كوماند /setup_birthday (خاص بالمشرفين) =================
 @bot.tree.command(name="setup_birthday", description="إرسال رسالة تسجيل أعياد الميلاد للأعضاء 🎂")
 @app_commands.checks.has_permissions(administrator=True)
@@ -354,79 +355,132 @@ async def birthday_list_command(interaction: discord.Interaction):
     except Exception as e:
         await interaction.response.send_message("❌ حدث خطأ أثناء جلب اللائحة من قاعدة البيانات.", ephemeral=True)
         print("Birthday list DB error:", e)
+        # ================= 8. الفحص الأوتوماتيكي (على جميع السيرفرات + لوقز واضحة) =================
+LAST_HEARTBEAT_TS = 0.0
 
-# ================= 8. الفحص الأوتوماتيكي (حسب توقيت كل دولة + أمان ضد RESUME) =================
+def resolve_channel_for_guild(guild: discord.Guild):
+    if TARGET_CHANNEL_ID:
+        ch = guild.get_channel(TARGET_CHANNEL_ID)
+        if ch:
+            return ch
+    if CHANNEL_ID:
+        ch = guild.get_channel(CHANNEL_ID)
+        if ch:
+            return ch
+    return None
+
 @tasks.loop(minutes=1)
 async def check_birthdays():
-    channel = bot.get_channel(CHANNEL_ID)
-    if not channel:
-        return
+    global LAST_HEARTBEAT_TS
+    import time
 
     try:
         db = await bot.ensure_db()
-        guild = channel.guild
-        guild_id = str(guild.id)
+        now_ts = time.time()
+        should_log_heartbeat = (now_ts - LAST_HEARTBEAT_TS) >= 900
+        if should_log_heartbeat:
+            LAST_HEARTBEAT_TS = now_ts
+            print(f"💓 [LOOP-ALIVE] guilds={[f'{g.name}({g.id})' for g in bot.guilds]}")
 
-        rows = await db.fetch(
-            "SELECT user_id, birth_day, birth_month, timezone, last_wished_year FROM birthdays WHERE guild_id = $1",
-            guild_id
-        )
+        for guild in bot.guilds:
+            guild_id = str(guild.id)
+            channel = resolve_channel_for_guild(guild)
 
-        for row in rows:
-            user_id = row["user_id"]
-            day = row["birth_day"]
-            month = row["birth_month"]
-            tz_name = row["timezone"] or "Africa/Casablanca"
-            last_wished_year = row["last_wished_year"]
+            rows = await db.fetch(
+                "SELECT user_id, birth_day, birth_month, timezone, last_wished_year FROM birthdays WHERE guild_id = $1",
+                guild_id
+            )
 
-            try:
-                user_tz = pytz.timezone(tz_name)
-            except pytz.UnknownTimeZoneError:
-                user_tz = pytz.timezone("Africa/Casablanca")
+            if should_log_heartbeat:
+                ch_info = f"#{channel.id} ({channel.name})" if channel else "NONE"
+                print(f"📊 [LOOP-GUILD] guild={guild.name}({guild_id}) | channel={ch_info} | rows={len(rows)}")
 
-            now_user = datetime.now(user_tz)
+            for row in rows:
+                user_id = str(row["user_id"])
+                day = int(row["birth_day"])
+                month = int(row["birth_month"])
+                tz_name = row["timezone"] or "Africa/Casablanca"
+                last_wished_year = row["last_wished_year"] or 0
 
-            is_midnight_window = (now_user.hour == 0)
-            is_today = (day == now_user.day and month == now_user.month)
+                try:
+                    user_tz = pytz.timezone(tz_name)
+                except pytz.UnknownTimeZoneError:
+                    print(f"⚠️ [LOOP-TZ] Unknown tz '{tz_name}' for user={user_id} in guild={guild_id}, fallback Africa/Casablanca")
+                    user_tz = pytz.timezone("Africa/Casablanca")
 
-            if is_midnight_window and is_today and last_wished_year != now_user.year:
-                member = guild.get_member(int(user_id))
-                if not member:
-                    continue
+                now_user = datetime.now(user_tz)
 
-                birthday_text = (
-                    "🎂 عيد ميلاد سعيد يا نجمنا!\n\n"
-                    "اليوم ليس يوماً عادياً في Eternal World، اليوم نحتفل بأحد أعضاء عائلتنا الغالية! 🤍\n\n"
-                    "كل عام وأنت بخير، ونتمنى لك سنة جديدة مليئة بالأيام الجميلة، والتجارب التي تستحق أن تُعاش، والذكريات التي تستحق أن تبقى.\n\n"
-                    "نحن سعداء بوجودك بيننا، ونتمنى أن يحمل لك عامك الجديد الكثير مما تحب وتتمنى.\n\n"
-                    "استمتع بيومك، فأنت نجم احتفالنا اليوم! ✨\n\n"
-                    "من عائلة Eternal World، بكل الحب. 🤍"
-                )
+                is_midnight_window = (now_user.hour == 0)
+                is_today = (day == now_user.day and month == now_user.month)
 
-                embed = discord.Embed(
-                    description=birthday_text,
-                    color=0xFFC0CB
-                )
+                if is_today and should_log_heartbeat:
+                    print(
+                        f"🎂 [LOOP-TODAY] guild={guild_id} user={user_id} tz={tz_name} "
+                        f"now={now_user.strftime('%Y-%m-%d %H:%M')} hour==0:{is_midnight_window} "
+                        f"last_wished_year:{last_wished_year} cur_year:{now_user.year}"
+                    )
 
-                content_mentions = f"@everyone | {member.mention}"
+                if is_midnight_window and is_today and last_wished_year != now_user.year:
+                    if not channel:
+                        print(f"❌ [LOOP-NO-CH] No valid channel resolved for guild={guild.name}({guild_id}) to wish user={user_id}")
+                        continue
 
-                if os.path.exists(IMAGE_FILENAME):
-                    file = discord.File(IMAGE_FILENAME, filename="happy_birthday.jpg")
-                    embed.set_image(url="attachment://happy_birthday.jpg")
-                    await channel.send(content=content_mentions, embed=embed, file=file)
-                else:
-                    await channel.send(content=content_mentions, embed=embed)
+                    print(f"🚀 [LOOP-SENDING] guild={guild_id} user={user_id} -> #{channel.id}")
 
-                await db.execute(
-                    "UPDATE birthdays SET last_wished_year = $1 WHERE user_id = $2 AND guild_id = $3",
-                    now_user.year, user_id, guild_id
-                )
+                    member = guild.get_member(int(user_id))
+                    if not member:
+                        try:
+                            member = await guild.fetch_member(int(user_id))
+                        except Exception as e:
+                            print(f"❌ [LOOP-MEMBER-ERR] fetch_member failed user={user_id} guild={guild_id}: {e}")
+                            member = None
+
+                    if not member:
+                        print(f"⚠️ [LOOP-SKIP] Member {user_id} not in guild {guild_id}")
+                        continue
+
+                    birthday_text = (
+                        "🎂 عيد ميلاد سعيد يا نجمنا!\n\n"
+                        "اليوم ليس يوماً عادياً في Eternal World، اليوم نحتفل بأحد أعضاء عائلتنا الغالية! 🤍\n\n"
+                        "كل عام وأنت بخير، ونتمنى لك سنة جديدة مليئة بالأيام الجميلة، والتجارب التي تستحق أن تُعاش، والذكريات التي تستحق أن تبقى.\n\n"
+                        "نحن سعداء بوجودك بيننا، ونتمنى أن يحمل لك عامك الجديد الكثير مما تحب وتتمنى.\n\n"
+                        "استمتع بيومك، فأنت نجم احتفالنا اليوم! ✨\n\n"
+                        "من عائلة Eternal World، بكل الحب. 🤍"
+                    )
+
+                    embed = discord.Embed(
+                        description=birthday_text,
+                        color=0xFFC0CB
+                    )
+
+                    content_mentions = f"@everyone | {member.mention}"
+                    mentions_policy = discord.AllowedMentions(everyone=True, users=True)
+
+                    try:
+                        if os.path.exists(IMAGE_FILENAME):
+                            file = discord.File(IMAGE_FILENAME, filename="happy_birthday.jpg")
+                            embed.set_image(url="attachment://happy_birthday.jpg")
+                            await channel.send(content=content_mentions, embed=embed, file=file, allowed_mentions=mentions_policy)
+                        else:
+                            print(f"⚠️ [LOOP-IMG] {IMAGE_FILENAME} not found, sending without image")
+                            await channel.send(content=content_mentions, embed=embed, allowed_mentions=mentions_policy)
+                    except Exception as send_err:
+                        print(f"❌ [LOOP-SEND-ERR] guild={guild_id} ch=#{channel.id} user={user_id}: {send_err}")
+                        continue
+
+                    await db.execute(
+                        "UPDATE birthdays SET last_wished_year = $1 WHERE user_id = $2 AND guild_id = $3",
+                        now_user.year, user_id, guild_id
+                    )
+                    print(f"✅ [LOOP-SENT] guild={guild_id} user={user_id} year={now_user.year}")
+
     except Exception as e:
-        print("Check birthdays loop error:", e)
+        print(f"❌ [LOOP-CRASH] check_birthdays error: {repr(e)}")
 
 @check_birthdays.before_loop
 async def before_check():
     await bot.wait_until_ready()
+    print("⏳ [LOOP-READY] check_birthdays started after bot ready.")
 
 # ================= 9. إرسال تهنئة فورية في روم محدد (للأونر فقط) =================
 TARGET_CHANNEL_ID = 1569523433514205254  # حطي هنا ID ديال الروم اللي بغيتي توصل فيه هاد التهنئة (أرقام فقط)
@@ -473,4 +527,3 @@ async def on_ready():
         check_birthdays.start()
 
 bot.run(TOKEN)
-                                                       
